@@ -2,20 +2,24 @@ import { App, Editor, MarkdownView, Modal, Notice, Plugin, requestUrl } from 'ob
 
 export default class UrlNamer extends Plugin {
 
-    modal: MsgModal = new MsgModal(this.app);
-
     async onload() {
         this.addCommand({
-            id: 'url-namer-selection',
+            id: 'name-url-links-in-selection',
             name: 'Name the URL links in the selected text',
             editorCallback: (editor: Editor, view: MarkdownView) => {
+                const modal = new MsgModal(this.app);
                 const loadingIndicator = new Notice('Fetching titles for selected text...', 0);
                 UrlTagger.getTaggedText(editor.getSelection())
                     .then(taggedText => {
                         editor.replaceSelection(taggedText);
-                        loadingIndicator.hide();
                     })
-                    .catch(e => this.modal.showMsg(e.message));
+                    .catch(e => {
+                        const message = e instanceof Error ? e.message : String(e);
+                        modal.showMsg(message);
+                    })
+                    .finally(() => {
+                        loadingIndicator.hide();
+                    });
             }
         });
     }
@@ -49,22 +53,36 @@ class MsgModal extends Modal {
 
 class UrlTagger {
 
-    static rawUrlPattern = /(?<!\]\(\s*)(?<=\s|\(|\[|^)(?:https?:\/\/)?[a-zA-Z0-9]+[a-zA-Z0-9\-_.]*\.[a-z]{2,6}[^\s]*\b/gim;
+    // Capture the preceding character (or empty string for start-of-line) in group 1,
+    // and the URL in group 2. This avoids lookbehind assertions (unsupported on iOS < 16.4).
+    static rawUrlPattern = /(^|[\s([])((?:https?:\/\/)?[a-zA-Z0-9]+[a-zA-Z0-9\-_.]*\.[a-z]{2,6}[^\s]*\b)/gim;
 
     static async getTaggedText(selectedText: string) {
-        const promises: any[] = [];
+        const promises: Promise<string>[] = [];
 
-        selectedText.replace(UrlTagger.rawUrlPattern, match => {
-            const promise = UrlTitleFetcher.getNamedUrlTag(match);
-            promises.push(promise);
-            return match;
+        selectedText.replace(UrlTagger.rawUrlPattern, (fullMatch, prefix: string, url: string, offset: number) => {
+            if (UrlTagger.isAlreadyLinked(selectedText, offset, prefix)) {
+                return fullMatch;
+            }
+            promises.push(UrlTitleFetcher.getNamedUrlTag(url));
+            return fullMatch;
         });
 
         const namedTags = await Promise.all(promises);
 
         new Notice(`Processed ${namedTags.length} urls.`);
 
-        return selectedText.replace(UrlTagger.rawUrlPattern, () => namedTags.shift());
+        return selectedText.replace(UrlTagger.rawUrlPattern, (fullMatch, prefix: string, url: string, offset: number) => {
+            if (UrlTagger.isAlreadyLinked(selectedText, offset, prefix)) {
+                return fullMatch;
+            }
+            return prefix + (namedTags.shift() ?? url);
+        });
+    }
+
+    // Returns true if the URL is already inside a Markdown link like [text](url)
+    private static isAlreadyLinked(text: string, offset: number, prefix: string): boolean {
+        return prefix === '(' && text.charAt(offset - 1) === ']';
     }
 
 }
@@ -78,13 +96,14 @@ class UrlTitleFetcher {
         try {
             new URL(s);
             return true;
-        } catch (err) {
+        } catch {
             return false;
         }
-    };
+    }
 
-    static parseTitle(url: string, body: string): string {
-        let match = url.includes('mp.weixin.qq.com') ?
+    static parseTitle(reqUrl: string, body: string): string {
+        const { hostname } = new URL(reqUrl);
+        const match = hostname === 'mp.weixin.qq.com' ?
             body.match(this.wxTitlePattern)
             : body.match(this.htmlTitlePattern);
 
@@ -110,10 +129,10 @@ class UrlTitleFetcher {
             }
 
             const body = res.text;
-            const title = this.parseTitle(url, body);
+            const title = this.parseTitle(reqUrl, body);
             return `[${title}](${url})`;
         } catch (error) {
-            new Notice(`Error handling URL ${url}: ${error}`);
+            new Notice(`Error handling URL ${url}: ${String(error)}`);
             return url;
         }
     }
